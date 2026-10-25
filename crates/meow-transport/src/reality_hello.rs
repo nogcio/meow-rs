@@ -13,8 +13,9 @@
 //! ships) and deliberately match the versions the BoringSSL backend parrots
 //! for plain TLS (`tls/boring_backend.rs`): `chrome` is Chrome 120,
 //! `firefox` Firefox 120, `safari` Safari 16.0, `ios` iOS 14, `edge`
-//! Edge 85.  None of them offers a hybrid post-quantum share, so the
-//! handshake only ever has to complete X25519.
+//! Edge 85. When explicitly enabled, the REALITY hybrid option adds
+//! X25519MLKEM768 before X25519; this is an overlay on those historical
+//! profiles, not a claim of a version-exact modern browser fingerprint.
 
 use crate::{Result, TransportError};
 
@@ -23,6 +24,7 @@ use crate::{Result, TransportError};
 const GREASE: u16 = 0x0a0a;
 
 const GROUP_X25519: u16 = 0x001d;
+const GROUP_X25519_MLKEM768: u16 = 0x11ec;
 const GROUP_P256: u16 = 0x0017;
 
 const EXT_PADDING: u16 = 21;
@@ -436,6 +438,8 @@ pub(crate) struct HelloParams<'a> {
     pub(crate) alpn: &'a [String],
     pub(crate) random: &'a [u8; 32],
     pub(crate) x25519_public: &'a [u8; 32],
+    /// Serialized ML-KEM-768 encapsulation key; the hybrid share reuses X25519.
+    pub(crate) mlkem_public: Option<&'a [u8]>,
 }
 
 /// Encode a framed ClientHello handshake message shaped like `profile`.
@@ -448,6 +452,11 @@ pub(crate) fn build_client_hello(
     params: &HelloParams<'_>,
 ) -> Result<Vec<u8>> {
     let spec = profile.spec();
+    if params.mlkem_public.is_some_and(|key| key.len() != 1184) {
+        return Err(TransportError::Config(
+            "invalid ML-KEM-768 public key length".into(),
+        ));
+    }
     let grease = GreaseValues::random();
 
     let mut order: Vec<Ext> = spec.extensions.to_vec();
@@ -481,7 +490,19 @@ pub(crate) fn build_client_hello(
             Ext::RenegotiationInfo => (0xff01, vec![0]),
             Ext::SupportedGroups(groups) => {
                 let mut data = Vec::with_capacity(2 + groups.len() * 2);
-                put_u16_list(groups, grease.group, &mut data);
+                if params.mlkem_public.is_some() {
+                    let mut hybrid_groups = groups.to_vec();
+                    let index = hybrid_groups
+                        .iter()
+                        .position(|group| *group == GROUP_X25519)
+                        .ok_or_else(|| {
+                            TransportError::Config("profile has no X25519 group".into())
+                        })?;
+                    hybrid_groups.insert(index, GROUP_X25519_MLKEM768);
+                    put_u16_list(&hybrid_groups, grease.group, &mut data);
+                } else {
+                    put_u16_list(groups, grease.group, &mut data);
+                }
                 (10, data)
             }
             Ext::PointFormats => (11, vec![1, 0]),
@@ -510,6 +531,12 @@ pub(crate) fn build_client_hello(
                     put_u16(grease.group, &mut shares);
                     put_u16(1, &mut shares);
                     shares.push(0);
+                }
+                if let Some(public_key) = params.mlkem_public {
+                    put_u16(GROUP_X25519_MLKEM768, &mut shares);
+                    put_u16((public_key.len() + 32) as u16, &mut shares);
+                    shares.extend_from_slice(public_key);
+                    shares.extend_from_slice(params.x25519_public);
                 }
                 put_u16(GROUP_X25519, &mut shares);
                 put_u16(32, &mut shares);
@@ -660,6 +687,7 @@ mod tests {
                 alpn,
                 random: &[7u8; 32],
                 x25519_public: &[3u8; 32],
+                mlkem_public: None,
             },
         )
         .expect("client hello")
@@ -828,6 +856,73 @@ mod tests {
         assert_eq!(ext(&parsed, 16), b"\x00\x0c\x02h2\x08http/1.1");
         let parsed = parse(&build(HelloProfile::Chrome, &["h2".to_string()]));
         assert_eq!(ext(&parsed, 16), b"\x00\x03\x02h2");
+    }
+
+    #[test]
+    fn hybrid_offer_preserves_profile_extensions_and_reuses_the_authentication_key() {
+        let mlkem_public = [5u8; 1184];
+        let alpn = ["http/1.1".to_owned()];
+        for profile in [
+            HelloProfile::Chrome,
+            HelloProfile::Firefox,
+            HelloProfile::Safari,
+            HelloProfile::Ios,
+            HelloProfile::Edge,
+        ] {
+            let hello = build_client_hello(
+                profile,
+                &HelloParams {
+                    server_name: "example.com",
+                    alpn: &alpn,
+                    random: &[7; 32],
+                    x25519_public: &[3; 32],
+                    mlkem_public: Some(&mlkem_public),
+                },
+            )
+            .unwrap();
+            let parsed = parse(&hello);
+            assert_eq!(&hello[39..71], &[0; 32], "seal must own the session ID");
+            assert_eq!(ext(&parsed, 0), b"\x00\x0e\x00\x00\x0bexample.com");
+            assert_eq!(ext(&parsed, 16), b"\x00\x09\x08http/1.1");
+            let groups: Vec<_> = ext(&parsed, 10)[2..]
+                .chunks_exact(2)
+                .map(|v| u16::from_be_bytes([v[0], v[1]]))
+                .filter(|g| !is_grease(*g))
+                .collect();
+            assert_eq!(&groups[..2], &[GROUP_X25519_MLKEM768, GROUP_X25519]);
+            let shares = ext(&parsed, 51);
+            assert_eq!(usize::from(u16_at(shares, 0)), shares.len() - 2);
+            let mut offset = 2;
+            if is_grease(u16_at(shares, offset)) {
+                offset += 5;
+            }
+            assert_eq!(u16_at(shares, offset), GROUP_X25519_MLKEM768);
+            assert_eq!(u16_at(shares, offset + 2), 1216);
+            assert_eq!(&shares[offset + 4..offset + 1188], &mlkem_public);
+            assert_eq!(&shares[offset + 1188..offset + 1220], &[3; 32]);
+            offset += 1220;
+            assert_eq!(u16_at(shares, offset), GROUP_X25519);
+            assert_eq!(u16_at(shares, offset + 2), 32);
+            assert_eq!(&shares[offset + 4..offset + 36], &[3; 32]);
+        }
+    }
+
+    #[test]
+    fn malformed_hybrid_public_key_is_not_silently_omitted() {
+        for size in [0, 1183, 1185] {
+            let public = vec![5; size];
+            assert!(build_client_hello(
+                HelloProfile::Chrome,
+                &HelloParams {
+                    server_name: "example.com",
+                    alpn: &[],
+                    random: &[7; 32],
+                    x25519_public: &[3; 32],
+                    mlkem_public: Some(&public),
+                }
+            )
+            .is_err());
+        }
     }
 
     #[test]

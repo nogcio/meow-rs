@@ -21,6 +21,10 @@ use crate::{
     Result, Stream, Transport, TransportError,
 };
 
+#[path = "reality_kx.rs"]
+mod kx;
+use kx::{HybridExchange, GROUP_X25519_MLKEM768};
+
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha384 = Hmac<Sha384>;
 type HmacSha512 = Hmac<Sha512>;
@@ -184,13 +188,17 @@ async fn reality_handshake(
     clamp_x25519_private(&mut client_private);
     let client_public = x25519_public_from_private(&client_private);
     let auth_key = x25519(&client_private, &reality.public_key)?;
+    let hybrid = HybridExchange::new(reality.support_x25519_mlkem768)?;
 
     let mut client_random = rand::random::<[u8; 32]>();
     let (client_hello, reality_auth_key) = build_reality_client_hello(
-        server_name,
-        alpn,
-        &client_random,
-        &client_public,
+        &HelloParams {
+            server_name,
+            alpn,
+            random: &client_random,
+            x25519_public: &client_public,
+            mlkem_public: hybrid.public_key(),
+        },
         &auth_key,
         reality,
         profile,
@@ -215,7 +223,11 @@ async fn reality_handshake(
             "Reality TLS: server did not echo ClientHello session_id".into(),
         ));
     }
-    let shared_secret = x25519(&client_private, &parsed_server_hello.key_share)?;
+    let shared_secret = hybrid.complete(
+        parsed_server_hello.group,
+        &parsed_server_hello.key_share,
+        &client_private,
+    )?;
     transcript.extend_from_slice(&server_hello);
 
     let cipher = CipherSuite::try_from(parsed_server_hello.cipher_suite)?;
@@ -607,10 +619,7 @@ fn transport_io_error(e: TransportError) -> io::Error {
 }
 
 fn build_reality_client_hello(
-    server_name: &str,
-    alpn: &[String],
-    random: &[u8; 32],
-    key_share: &[u8; 32],
+    params: &HelloParams<'_>,
     auth_key: &[u8; 32],
     reality: &RealityConfig,
     profile: HelloProfile,
@@ -618,15 +627,7 @@ fn build_reality_client_hello(
     // The hello comes back with a zeroed 32-byte session_id at [39..71];
     // the seal below authenticates those exact bytes as AAD, so nothing
     // but the session_id may change after this point.
-    let mut hello = build_client_hello(
-        profile,
-        &HelloParams {
-            server_name,
-            alpn,
-            random,
-            x25519_public: key_share,
-        },
-    )?;
+    let mut hello = build_client_hello(profile, params)?;
 
     let auth_key = hkdf_sha256(auth_key, &hello[4 + 2..4 + 2 + 20], b"REALITY", 32);
     let mut aead_key = [0u8; 32];
@@ -654,7 +655,7 @@ fn build_reality_client_hello(
 
     let cipher = Aes256Gcm::new_from_slice(&aead_key)
         .map_err(|e| TransportError::Tls(format!("Reality AES-GCM key: {e}")))?;
-    let nonce = Nonce::from_slice(&random[20..32]);
+    let nonce = Nonce::from_slice(&params.random[20..32]);
     let mut session_id = reality_plain.to_vec();
     let tag = cipher
         .encrypt_in_place_detached(nonce, &hello, &mut session_id)
@@ -776,7 +777,8 @@ async fn read_record<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<TlsRecord
 struct ParsedServerHello {
     cipher_suite: u16,
     session_id: Vec<u8>,
-    key_share: [u8; 32],
+    group: u16,
+    key_share: Vec<u8>,
 }
 
 fn parse_server_hello(raw: &[u8]) -> Result<ParsedServerHello> {
@@ -838,15 +840,18 @@ fn parse_server_hello(raw: &[u8]) -> Result<ParsedServerHello> {
                 // The browser profiles advertise more groups than the
                 // handshake can complete; a peer that picks one of them
                 // must fail loudly, not degrade.
-                if group != GROUP_X25519 || bytes.len() != 32 {
-                    return Err(TransportError::Tls(format!(
-                        "Reality TLS: server selected key-share group 0x{group:04x}; \
-                         only X25519 is supported"
-                    )));
+                if p != data.len()
+                    || key_share.is_some()
+                    || !matches!(
+                        (group, bytes.len()),
+                        (GROUP_X25519, 32) | (GROUP_X25519_MLKEM768, 1120)
+                    )
+                {
+                    return Err(TransportError::Tls(
+                        "Reality TLS: invalid server key share".into(),
+                    ));
                 }
-                let mut share = [0u8; 32];
-                share.copy_from_slice(bytes);
-                key_share = Some(share);
+                key_share = Some((group, bytes.to_vec()));
             }
             _ => {}
         }
@@ -856,11 +861,13 @@ fn parse_server_hello(raw: &[u8]) -> Result<ParsedServerHello> {
             "Reality TLS: server did not negotiate TLS 1.3".into(),
         ));
     }
+    let (group, key_share) =
+        key_share.ok_or_else(|| TransportError::Tls("Reality TLS: missing key share".into()))?;
     Ok(ParsedServerHello {
         cipher_suite,
         session_id,
-        key_share: key_share
-            .ok_or_else(|| TransportError::Tls("Reality TLS: missing X25519 key share".into()))?,
+        group,
+        key_share,
     })
 }
 
@@ -1162,7 +1169,7 @@ struct HandshakeKeys {
 }
 
 impl HandshakeKeys {
-    fn derive(cipher: CipherSuite, shared_secret: &[u8; 32], transcript: &[u8]) -> Self {
+    fn derive(cipher: CipherSuite, shared_secret: &[u8], transcript: &[u8]) -> Self {
         let hash = cipher.hash();
         let zero = vec![0u8; hash.len()];
         let empty_hash = hash.digest(&[]);
@@ -1463,10 +1470,13 @@ mod tests {
         let client_public = [3u8; 32];
         let auth_key = [5u8; 32];
         let (hello, _) = build_reality_client_hello(
-            "example.com",
-            &[],
-            &random,
-            &client_public,
+            &HelloParams {
+                server_name: "example.com",
+                alpn: &[],
+                random: &random,
+                x25519_public: &client_public,
+                mlkem_public: None,
+            },
             &auth_key,
             &reality,
             HelloProfile::Chrome,
@@ -1781,10 +1791,13 @@ mod tests {
         let client_public = [3u8; 32];
         let auth_key = [5u8; 32];
         let (hello, returned_key) = build_reality_client_hello(
-            "example.com",
-            &[],
-            &random,
-            &client_public,
+            &HelloParams {
+                server_name: "example.com",
+                alpn: &[],
+                random: &random,
+                x25519_public: &client_public,
+                mlkem_public: None,
+            },
             &auth_key,
             &reality,
             HelloProfile::Chrome,

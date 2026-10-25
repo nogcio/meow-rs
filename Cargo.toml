@@ -247,7 +247,8 @@ parking_lot = "0.12"
 # `links = "boringssl"` package and cargo refuses to resolve. 5.x carries the
 # `BIO_CTRL_FLUSH` retry-flag fix (cloudflare/boring@ed76885, #569/#572) plus
 # every ECH / uTLS API the transport backend uses.
-boring       = { version = "5.2" }
+# REALITY's optional hybrid exchange uses the safe ML-KEM API introduced in 5.3.
+boring       = { version = "5.3" }
 tokio-boring = { version = "5.2" }
 boring-sys   = { version = "5.2" }
 # `X509VerifyParamRef::as_ptr` for the `set_purpose`/`set1_ip` FFI calls

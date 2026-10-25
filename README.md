@@ -4,6 +4,12 @@
 
 # meow-rs
 
+> `nogcio` maintains this fork of [meow-rs/meow-rs](https://github.com/meow-rs/meow-rs)
+> for library integration. The initial change implements the optional
+> [hybrid REALITY client exchange](docs/specs/reality-hybrid-client.md), with an
+> explicit isolated current-peer regression. Upstream provenance and MIT licensing
+> are retained; library tests do not establish a working NetworkManager VPN.
+
 A high-performance Rust implementation of the [mihomo](https://github.com/MetaCubeX/mihomo) (Clash Meta) proxy kernel. Rule-based tunneling with support for multiple proxy protocols, transparent proxy, DNS snooping, a persistent logbook, a REST API, and a built-in web dashboard.
 
 Beyond mihomo, meow keeps [`dialer-proxy` chains](#dialer-proxy-chains) working when a member of the dialer group can pass its URL test but not reach the chained server, and keeps a [logbook](#logbook) of what the engine did (reloads, provider failures, crashes, chained nodes going down) that survives restarts.

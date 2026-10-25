@@ -81,6 +81,9 @@ pub enum EchOpts {
 pub struct RealityConfig {
     pub public_key: [u8; 32],
     pub short_id: [u8; 8],
+    /// Offer X25519MLKEM768 before X25519, using BoringSSL's ML-KEM-768.
+    /// The REALITY authentication key still uses the shared ephemeral X25519 key.
+    /// This overlays the historical browser profile; `false` preserves its old wire shape.
     pub support_x25519_mlkem768: bool,
 }
 
