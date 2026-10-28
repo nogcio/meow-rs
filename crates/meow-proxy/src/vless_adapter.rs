@@ -70,6 +70,24 @@ pub struct VlessAdapter {
 }
 
 impl VlessAdapter {
+    /// Open a domain-addressed XUDP flow with no resolver or ordinary-UDP fallback.
+    /// Requires an enabled Mux.Cool adapter. The returned connection must be used
+    /// through write_packet_to/read_packet_from to preserve domain wire addresses.
+    /// Validation occurs before dialing; errors, cancellation and Drop retain the
+    /// mux session's ownership semantics. The configured dialer remains authoritative.
+    #[cfg(feature = "mux")]
+    pub async fn dial_xudp_domain(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<Box<dyn ProxyPacketConn>> {
+        meow_common::PacketAddr::domain(host, port)?;
+        let mux = self
+            .mux
+            .as_ref()
+            .ok_or_else(|| MeowError::NotSupported("Domain XUDP requires Mux.Cool".into()))?;
+        mux.open_domain_xudp(host, port).await
+    }
     /// Construct a `VlessAdapter`.
     ///
     /// `uuid_bytes` — 16-byte binary UUID.
@@ -445,6 +463,83 @@ mod tests {
             TransportChain::empty(),
             Arc::new(DirectDialer),
         )
+    }
+
+    #[cfg(feature = "mux")]
+    #[tokio::test]
+    async fn explicit_domain_xudp_rejects_invalid_configuration_before_dialing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountDial(Arc<AtomicUsize>);
+        #[async_trait]
+        impl crate::dialer::TcpDialer for CountDial {
+            async fn dial(
+                &self,
+                _: &str,
+                _: u16,
+                _: bool,
+            ) -> std::io::Result<Box<dyn meow_transport::Stream>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::other("Unexpected test dial"))
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        for mux in [
+            None,
+            Some(crate::mux::MuxOptions {
+                protocol: crate::mux::Protocol::Smux,
+                ..Default::default()
+            }),
+            Some(crate::mux::MuxOptions {
+                protocol: crate::mux::Protocol::MuxCool,
+                only_tcp: true,
+                ..Default::default()
+            }),
+        ] {
+            let mut adapter = VlessAdapter::new(
+                "test",
+                "127.0.0.1",
+                9,
+                [0; 16],
+                None,
+                true,
+                TransportChain::empty(),
+                Arc::new(CountDial(Arc::clone(&calls))),
+            );
+            if let Some(options) = mux {
+                adapter = adapter.with_mux(options);
+            }
+            assert!(adapter
+                .dial_xudp_domain("owned.example", 443)
+                .await
+                .is_err());
+        }
+        let adapter = VlessAdapter::new(
+            "test",
+            "127.0.0.1",
+            9,
+            [0; 16],
+            None,
+            true,
+            TransportChain::empty(),
+            Arc::new(CountDial(Arc::clone(&calls))),
+        )
+        .with_mux(crate::mux::MuxOptions {
+            protocol: crate::mux::Protocol::MuxCool,
+            ..Default::default()
+        });
+        for (host, port) in [
+            ("", 443),
+            ("private-token://invalid", 443),
+            ("owned.example", 0),
+        ] {
+            let error = adapter
+                .dial_xudp_domain(host, port)
+                .await
+                .err()
+                .expect("invalid target accepted");
+            assert!(!error.to_string().contains("private-token"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     // ─── I1: adapter_type() returns Vless ────────────────────────────────────

@@ -214,7 +214,7 @@ pub(crate) fn encode_keepalive_frame() -> Bytes {
 
 /// Destination host parsed from a frame's address block.  IP destinations —
 /// the overwhelmingly common case on the UDP hot path — stay as `IpAddr`, so
-/// `dest_to_socket` builds the `SocketAddr` directly instead of round
+/// the reader builds the `SocketAddr` directly instead of round
 /// tripping through `to_string()`/reparse; domains (rare here) keep their
 /// raw bytes, same as before.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1309,19 +1309,17 @@ impl Drop for PacketConn {
     }
 }
 
-/// Resolve a frame destination to a SocketAddr; domains (rare on the UDP
-/// path) fall back to the stream's bound destination.  IP destinations
-/// build the SocketAddr directly - no string parse on this hot path.
-fn dest_to_socket(dest: &Dest, port: u16, fallback: SocketAddr) -> SocketAddr {
-    match dest {
-        Dest::Ip(ip) => SocketAddr::new(*ip, port),
-        Dest::Domain(_) => fallback,
+/// Preserve the legacy SocketAddr-only API. Typed reads never call this lossy
+/// projection; missing/domain addresses stay distinguishable to typed consumers.
+fn legacy_source(source: Option<&(Dest, u16)>, fallback: SocketAddr) -> SocketAddr {
+    match source {
+        Some((Dest::Ip(ip), port)) => SocketAddr::new(*ip, *port),
+        _ => fallback,
     }
 }
 
-#[async_trait::async_trait]
-impl ProxyPacketConn for PacketConn {
-    async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+impl PacketConn {
+    async fn read_frame(&self, buf: &mut [u8]) -> Result<(usize, Option<(Dest, u16)>)> {
         let mut rx = self.rx.lock().await;
         loop {
             match rx.recv().await {
@@ -1342,10 +1340,7 @@ impl ProxyPacketConn for PacketConn {
                                 )));
                             }
                             buf[..bytes.len()].copy_from_slice(&bytes);
-                            let src = dest.map_or(self.bound, |(dest, port)| {
-                                dest_to_socket(&dest, port, self.bound)
-                            });
-                            return Ok((bytes.len(), src));
+                            return Ok((bytes.len(), dest));
                         }
                         Event::Eof => {
                             return Err(MeowError::Io(io::Error::new(
@@ -1365,6 +1360,36 @@ impl ProxyPacketConn for PacketConn {
             }
         }
     }
+}
+
+#[async_trait::async_trait]
+impl ProxyPacketConn for PacketConn {
+    async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        let (n, source) = self.read_frame(buf).await?;
+        Ok((n, legacy_source(source.as_ref(), self.bound)))
+    }
+
+    async fn read_packet_from(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<(usize, Option<meow_common::PacketAddr>)> {
+        let (n, source) = self.read_frame(buf).await?;
+        let source = match source {
+            Some((Dest::Ip(ip), port)) => {
+                Some(meow_common::PacketAddr::Ip(SocketAddr::new(ip, port)))
+            }
+            Some((Dest::Domain(bytes), port)) => {
+                let host = std::str::from_utf8(&bytes)
+                    .map_err(|_| MeowError::Proxy("Invalid domain packet source".into()))?;
+                Some(
+                    meow_common::PacketAddr::domain(host, port)
+                        .map_err(|_| MeowError::Proxy("Invalid domain packet source".into()))?,
+                )
+            }
+            None => None,
+        };
+        Ok((n, source))
+    }
 
     async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize> {
         if buf.len() > MAX_UDP_PAYLOAD {
@@ -1376,6 +1401,23 @@ impl ProxyPacketConn for PacketConn {
         // The destination rides the Keep frame meta, encoded straight from
         // the IP octets (no string round-trip on the hot datagram path).
         let frame = encode_udp_data_frame(self.sid, buf, addr.ip(), addr.port());
+        self.session
+            .send_frame(frame)
+            .await
+            .map_err(MeowError::Io)?;
+        Ok(buf.len())
+    }
+
+    async fn write_packet_to(&self, buf: &[u8], addr: &meow_common::PacketAddr) -> Result<usize> {
+        let (host, port) = match addr {
+            meow_common::PacketAddr::Ip(addr) => return self.write_packet(buf, addr).await,
+            meow_common::PacketAddr::Domain { host, port } => (host, port),
+        };
+        meow_common::PacketAddr::domain(host, *port)?;
+        if buf.is_empty() || buf.len() > MAX_UDP_PAYLOAD {
+            return Err(MeowError::Proxy("Invalid domain XUDP payload size".into()));
+        }
+        let frame = encode_data_frame(self.sid, buf, Some((host, *port))).map_err(MeowError::Io)?;
         self.session
             .send_frame(frame)
             .await
@@ -1774,15 +1816,15 @@ mod tests {
 
     /// Pins the UDP read-path allocation fix (issue #427): `parse_address`
     /// must hand back `Dest::Ip` directly (no `to_string()`/reparse round
-    /// trip), and `dest_to_socket` must build the SocketAddr straight from
+    /// trip), and the typed reader builds the SocketAddr straight from
     /// it. Domain destinations still fall back to the stream's bound addr.
     #[test]
-    fn dest_to_socket_uses_ip_directly_and_falls_back_for_domains() {
+    fn legacy_source_uses_ip_directly_and_falls_back_for_domains() {
         let (dest, port) = parse_address(&[0x1F, 0x90, ATYPE_IPV4, 10, 0, 2, 2]).unwrap();
         assert_eq!(dest, Dest::Ip("10.0.2.2".parse().unwrap()));
         let fallback: SocketAddr = "192.0.2.1:9".parse().unwrap();
         assert_eq!(
-            dest_to_socket(&dest, port, fallback),
+            legacy_source(Some(&(dest, port)), fallback),
             "10.0.2.2:8080".parse::<SocketAddr>().unwrap()
         );
 
@@ -1790,7 +1832,8 @@ mod tests {
         domain_bytes.extend_from_slice(b"host");
         let (dest, _) = parse_address(&domain_bytes).unwrap();
         assert!(matches!(dest, Dest::Domain(ref b) if b == b"host"));
-        assert_eq!(dest_to_socket(&dest, 80, fallback), fallback);
+        assert_eq!(legacy_source(Some(&(dest, 80)), fallback), fallback);
+        assert_eq!(legacy_source(None, fallback), fallback);
     }
 
     // --- Session round trips -------------------------------------------------
@@ -2681,6 +2724,124 @@ mod tests {
         let (n, src) = conn.read_packet(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"ping-udp");
         assert_eq!(src, dst);
+    }
+
+    #[tokio::test]
+    async fn typed_domain_udp_preserves_wire_sources_rejection_and_cancelled_reads() {
+        use meow_common::PacketAddr;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (session, log) = session_pair(vec![]).await;
+            let pool = Arc::new(MuxSession {
+                kind: super::super::client::SessionKind::MuxCool(Arc::clone(&session)),
+                streams: AtomicUsize::new(1),
+                last_used_ms: meow_common::atomic::AtomicU::new(0),
+                generation: 0,
+            });
+            let parts = session
+                .open_stream_parts("owned.example", 443, true)
+                .await
+                .unwrap();
+            let conn = PacketConn::new(parts, pool, "0.0.0.0:0".parse().unwrap());
+            let target = PacketAddr::domain("owned.example", 443).unwrap();
+            let mut buf = vec![0; 8192];
+            for source in [
+                target.clone(),
+                PacketAddr::domain("different.example", 8443).unwrap(),
+                PacketAddr::Ip("192.0.2.2:443".parse().unwrap()),
+            ] {
+                conn.write_packet_to(b"typed-payload", &source)
+                    .await
+                    .unwrap();
+                let (n, actual) = conn.read_packet_from(&mut buf).await.unwrap();
+                assert_eq!(&buf[..n], b"typed-payload");
+                assert_eq!(actual, Some(source));
+            }
+            assert_eq!(log.lock().unwrap().data_frames, 3);
+            for invalid in [
+                PacketAddr::Domain {
+                    host: "".into(),
+                    port: 443,
+                },
+                PacketAddr::Domain {
+                    host: "private-token://invalid".into(),
+                    port: 443,
+                },
+                PacketAddr::Domain {
+                    host: "owned.example".into(),
+                    port: 0,
+                },
+            ] {
+                let error = conn
+                    .write_packet_to(b"rejected", &invalid)
+                    .await
+                    .unwrap_err();
+                assert!(!error.to_string().contains("private-token"));
+            }
+            for payload in [vec![], vec![0; 8193]] {
+                assert!(conn.write_packet_to(&payload, &target).await.is_err());
+            }
+            // Poll the reader once, cancel it without a packet, then reuse it.
+            tokio::select! { biased;
+                _ = conn.read_packet_from(&mut buf) => panic!("Unexpected packet"),
+                _ = std::future::ready(()) => {}
+            }
+            conn.write_packet_to(b"after-rejection", &target)
+                .await
+                .unwrap();
+            let (n, source) = conn.read_packet_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"after-rejection");
+            assert_eq!(source, Some(target.clone()));
+            session
+                .send_frame(encode_data_frame(conn.sid, b"no-source", None).unwrap())
+                .await
+                .unwrap();
+            let (n, source) = conn.read_packet_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"no-source");
+            assert_eq!(source, None);
+            conn.write_packet_to(b"legacy", &target).await.unwrap();
+            let (_, source) = conn.read_packet(&mut buf).await.unwrap();
+            assert_eq!(source, conn.bound);
+            session
+                .send_frame(
+                    encode_data_frame(
+                        conn.sid,
+                        b"bad-source",
+                        Some(("private-token://invalid", 443)),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let error = conn.read_packet_from(&mut buf).await.unwrap_err();
+            assert!(!error.to_string().contains("private-token"));
+            session
+                .send_frame(
+                    encode_data_frame(
+                        conn.sid,
+                        b"legacy-bad-source",
+                        Some(("private-token://invalid", 443)),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let (_, source) = conn.read_packet(&mut buf).await.unwrap();
+            assert_eq!(source, conn.bound);
+            conn.write_packet_to(b"still-usable", &target)
+                .await
+                .unwrap();
+            let (n, source) = conn.read_packet_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"still-usable");
+            assert_eq!(source, Some(target));
+            let log = log.lock().unwrap();
+            assert_eq!(log.data_frames, 9);
+            assert_eq!(
+                log.new_frames[0].2,
+                Some((Dest::Domain(b"owned.example".to_vec()), 443))
+            );
+        })
+        .await
+        .expect("typed domain contract deadline");
     }
 
     #[tokio::test]

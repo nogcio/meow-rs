@@ -505,6 +505,22 @@ impl MuxClient {
         }
     }
 
+    /// Explicit opt-in for typed domain XUDP callers. The legacy metadata path
+    /// still declines Mux.Cool domains rather than falling back via an IP sentinel.
+    pub(crate) async fn open_domain_xudp(
+        self: &Arc<Self>,
+        host: &str,
+        port: u16,
+    ) -> Result<Box<dyn ProxyPacketConn>> {
+        meow_common::PacketAddr::domain(host, port)?;
+        if self.options.protocol != Protocol::MuxCool || !self.supports_udp() {
+            return Err(MeowError::NotSupported(
+                "Domain XUDP requires UDP-enabled Mux.Cool".into(),
+            ));
+        }
+        self.open_packet_stream(host, port).await
+    }
+
     /// Open a stream (writing its per-stream request: sing-mux prefix or
     /// Mux.Cool New frame), retrying once on a dead session — the shared
     /// core of the TCP and UDP open paths.

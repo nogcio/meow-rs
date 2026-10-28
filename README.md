@@ -9,6 +9,8 @@
 > [hybrid REALITY client exchange](docs/specs/reality-hybrid-client.md), with an
 > explicit isolated current-peer regression. Upstream provenance and MIT licensing
 > are retained; library tests do not establish a working NetworkManager VPN.
+> The opt-in [domain XUDP API](docs/specs/xudp-domain-api.md) preserves domain
+> destinations and typed source metadata without changing legacy UDP callers.
 
 A high-performance Rust implementation of the [mihomo](https://github.com/MetaCubeX/mihomo) (Clash Meta) proxy kernel. Rule-based tunneling with support for multiple proxy protocols, transparent proxy, DNS snooping, a persistent logbook, a REST API, and a built-in web dashboard.
 

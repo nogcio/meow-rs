@@ -145,3 +145,6 @@ tokio-tungstenite = { workspace = true }
 
 [lints]
 workspace = true
+[[example]]
+name = "xudp_domain"
+required-features = ["vless", "vless-vision", "mux"]
